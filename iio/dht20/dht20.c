@@ -11,6 +11,8 @@
 
 #define DHT20_TRIGGER_DELAY_MS	80
 #define DHT20_RESP_LEN		7
+#define DHT20_CRC_INIT		0xFF
+#define DHT20_CRC_POLY		0x31	/* x^8 + x^5 + x^4 + 1, x^8 implicit */
 
 static const u8 dht20_trigger_cmd[3] = { 0xAC, 0x33, 0x00 };
 
@@ -18,6 +20,36 @@ struct dht20_data {
 	struct i2c_client	*client;
 	struct mutex		lock;
 };
+
+static u8 dht20_crc8(const u8 *data, size_t len)
+{
+	u8 crc = DHT20_CRC_INIT;
+	size_t i;
+	int j;
+
+	for (i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (j = 0; j < 8; j++)
+			crc = (crc & 0x80) ? (crc << 1) ^ DHT20_CRC_POLY
+					   : (crc << 1);
+	}
+	return crc;
+}
+
+static int dht20_parse(const u8 *buf, s32 *t_c100, s32 *rh_c100)
+{
+	u32 s_rh, s_t;
+
+	if (dht20_crc8(buf, 6) != buf[6])
+		return -EIO;
+
+	s_rh = ((u32)buf[1] << 12) | ((u32)buf[2] << 4) | (buf[3] >> 4);
+	s_t  = (((u32)buf[3] & 0x0F) << 16) | ((u32)buf[4] << 8) | buf[5];
+
+	*rh_c100 = (s32)(((u64)s_rh * 10000) >> 20);
+	*t_c100  = (s32)(((u64)s_t  * 20000) >> 20) - 5000;
+	return 0;
+}
 
 static int dht20_read_sensor(struct dht20_data *data, u8 *buf)
 {
@@ -67,10 +99,20 @@ static int dht20_probe(struct i2c_client *client)
 	dev_info(&client->dev, "dht20 probed (addr=0x%02x)\n", client->addr);
 
 	ret = dht20_read_sensor(data, buf);
-	if (ret)
+	if (ret) {
 		dev_warn(&client->dev, "initial read failed: %d\n", ret);
-	else
-		dev_info(&client->dev, "raw: %*ph\n", DHT20_RESP_LEN, buf);
+	} else {
+		s32 t_c100, rh_c100;
+
+		ret = dht20_parse(buf, &t_c100, &rh_c100);
+		if (ret)
+			dev_warn(&client->dev, "parse failed: %d\n", ret);
+		else
+			dev_info(&client->dev,
+				 "T=%d.%02d C, RH=%d.%02d %%\n",
+				 t_c100 / 100, abs(t_c100 % 100),
+				 rh_c100 / 100, rh_c100 % 100);
+	}
 
 	return 0;
 }
