@@ -1,16 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * ASAIR DHT20 I2C humidity and temperature sensor driver.
- *
- * Task 2: minimal skeleton — probe/remove + module_i2c_driver.
  */
 
 #include <linux/module.h>
 #include <linux/i2c.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
+
+struct dht20_data {
+	struct i2c_client	*client;
+	struct mutex		lock;
+};
 
 static int dht20_probe(struct i2c_client *client)
 {
+	struct dht20_data *data;
+
+	data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	data->client = client;
+	mutex_init(&data->lock);
+	i2c_set_clientdata(client, data);
+
 	dev_info(&client->dev, "dht20 probed (addr=0x%02x)\n", client->addr);
 	return 0;
 }
