@@ -82,11 +82,59 @@ unlock:
 	return ret;
 }
 
+static int dht20_measure(struct dht20_data *data, s32 *t_c100, s32 *rh_c100)
+{
+	u8 buf[DHT20_RESP_LEN];
+	int ret;
+
+	ret = dht20_read_sensor(data, buf);
+	if (ret)
+		return ret;
+	return dht20_parse(buf, t_c100, rh_c100);
+}
+
+static ssize_t temperature_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct dht20_data *data = dev_get_drvdata(dev);
+	s32 t_c100, rh_c100;
+	int ret;
+
+	ret = dht20_measure(data, &t_c100, &rh_c100);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d.%02d\n",
+			  t_c100 / 100, abs(t_c100 % 100));
+}
+static DEVICE_ATTR_RO(temperature);
+
+static ssize_t humidity_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct dht20_data *data = dev_get_drvdata(dev);
+	s32 t_c100, rh_c100;
+	int ret;
+
+	ret = dht20_measure(data, &t_c100, &rh_c100);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d.%02d\n",
+			  rh_c100 / 100, rh_c100 % 100);
+}
+static DEVICE_ATTR_RO(humidity);
+
+static struct attribute *dht20_attrs[] = {
+	&dev_attr_temperature.attr,
+	&dev_attr_humidity.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(dht20);
+
 static int dht20_probe(struct i2c_client *client)
 {
 	struct dht20_data *data;
-	u8 buf[DHT20_RESP_LEN];
-	int ret;
 
 	data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -97,22 +145,6 @@ static int dht20_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, data);
 
 	dev_info(&client->dev, "dht20 probed (addr=0x%02x)\n", client->addr);
-
-	ret = dht20_read_sensor(data, buf);
-	if (ret) {
-		dev_warn(&client->dev, "initial read failed: %d\n", ret);
-	} else {
-		s32 t_c100, rh_c100;
-
-		ret = dht20_parse(buf, &t_c100, &rh_c100);
-		if (ret)
-			dev_warn(&client->dev, "parse failed: %d\n", ret);
-		else
-			dev_info(&client->dev,
-				 "T=%d.%02d C, RH=%d.%02d %%\n",
-				 t_c100 / 100, abs(t_c100 % 100),
-				 rh_c100 / 100, rh_c100 % 100);
-	}
 
 	return 0;
 }
@@ -138,6 +170,7 @@ static struct i2c_driver dht20_driver = {
 	.driver = {
 		.name		= "dht20",
 		.of_match_table	= dht20_of_match,
+		.dev_groups	= dht20_groups,
 	},
 	.probe		= dht20_probe,
 	.remove		= dht20_remove,
