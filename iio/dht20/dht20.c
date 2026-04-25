@@ -13,6 +13,10 @@
 #define DHT20_RESP_LEN		7
 #define DHT20_CRC_INIT		0xFF
 #define DHT20_CRC_POLY		0x31	/* x^8 + x^5 + x^4 + 1, x^8 implicit */
+#define DHT20_STATUS_CMD	0x71
+#define DHT20_STATUS_MASK	0x18	/* CAL + reserved bit, both must be set */
+#define DHT20_POWERON_DELAY_MS	100
+#define DHT20_POSTINIT_DELAY_MS	10
 
 static const u8 dht20_trigger_cmd[3] = { 0xAC, 0x33, 0x00 };
 
@@ -132,9 +136,31 @@ static struct attribute *dht20_attrs[] = {
 };
 ATTRIBUTE_GROUPS(dht20);
 
+static int dht20_check_status(struct i2c_client *client)
+{
+	u8 cmd = DHT20_STATUS_CMD;
+	u8 status;
+	int ret;
+
+	ret = i2c_master_send(client, &cmd, 1);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+
+	ret = i2c_master_recv(client, &status, 1);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+
+	return status;
+}
+
 static int dht20_probe(struct i2c_client *client)
 {
 	struct dht20_data *data;
+	int status;
 
 	data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -142,8 +168,22 @@ static int dht20_probe(struct i2c_client *client)
 
 	data->client = client;
 	mutex_init(&data->lock);
-	i2c_set_clientdata(client, data);
 
+	msleep(DHT20_POWERON_DELAY_MS);
+
+	status = dht20_check_status(client);
+	if (status < 0)
+		return status;
+
+	if ((status & DHT20_STATUS_MASK) != DHT20_STATUS_MASK) {
+		dev_err(&client->dev,
+			"sensor uncalibrated (status=0x%02x)\n", status);
+		return -ENODEV;
+	}
+
+	msleep(DHT20_POSTINIT_DELAY_MS);
+
+	i2c_set_clientdata(client, data);
 	dev_info(&client->dev, "dht20 probed (addr=0x%02x)\n", client->addr);
 
 	return 0;
