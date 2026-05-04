@@ -5,12 +5,16 @@
  * Datasheet: DHT20 Data Sheet v1.0, May 2021 (www.aosong.com)
  */
 
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 
 #include <linux/iio/iio.h>
+
+#define DHT20_POWERON_DELAY_MS		100
+#define DHT20_STATUS_INIT_MASK		0x18
 
 struct dht20_data {
 	struct i2c_client	*client;
@@ -21,11 +25,25 @@ static const struct iio_info dht20_info = {};
 
 static const struct iio_chan_spec dht20_channels[] = {};
 
+static int dht20_read_status(struct i2c_client *client, u8 *status)
+{
+	int ret;
+
+	ret = i2c_smbus_read_byte(client);
+	if (ret < 0)
+		return ret;
+
+	*status = ret;
+	return 0;
+}
+
 static int dht20_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct iio_dev *indio_dev;
 	struct dht20_data *data;
+	u8 status;
+	int ret;
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return -EOPNOTSUPP;
@@ -39,6 +57,17 @@ static int dht20_probe(struct i2c_client *client)
 	mutex_init(&data->lock);
 
 	i2c_set_clientdata(client, indio_dev);
+
+	msleep(DHT20_POWERON_DELAY_MS);
+
+	ret = dht20_read_status(client, &status);
+	if (ret < 0) {
+		dev_err(dev, "DHT20 not found at 0x%02x: %d\n",
+			client->addr, ret);
+		return -ENXIO;
+	}
+
+	dev_dbg(dev, "power-on status=0x%02x\n", status);
 
 	indio_dev->name = "dht20";
 	indio_dev->modes = INDIO_DIRECT_MODE;
