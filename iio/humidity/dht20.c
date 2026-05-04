@@ -32,6 +32,7 @@
 #define DHT20_MEAS_DELAY_MS		80
 #define DHT20_POLL_RETRY		3
 #define DHT20_POLL_INTERVAL_MS		10
+#define DHT20_MIN_INTERVAL_MS		2000
 
 #define DHT20_CRC_INIT			0xFF
 #define DHT20_CRC_POLY			0x31
@@ -41,6 +42,8 @@
 struct dht20_data {
 	struct i2c_client	*client;
 	struct mutex		lock;	/* serializes I2C transactions */
+	unsigned long		last_read;
+	bool			last_read_valid;
 };
 
 static const struct iio_info dht20_info = {};
@@ -152,6 +155,21 @@ static int dht20_wait_not_busy(struct i2c_client *client)
 	return -ETIMEDOUT;
 }
 
+static void dht20_wait_min_interval(struct dht20_data *data)
+{
+	unsigned long elapsed, remaining;
+
+	if (!data->last_read_valid)
+		return;
+
+	elapsed = jiffies_to_msecs(jiffies - data->last_read);
+	if (elapsed >= DHT20_MIN_INTERVAL_MS)
+		return;
+
+	remaining = DHT20_MIN_INTERVAL_MS - elapsed;
+	msleep(remaining);
+}
+
 static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 			     u32 *raw_temp)
 {
@@ -160,6 +178,8 @@ static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 		      DHT20_CMD_TRIGGER_ARG1 };
 	u8 buf[DHT20_RESP_LEN];
 	int ret;
+
+	dht20_wait_min_interval(data);
 
 	ret = i2c_master_send(client, cmd, sizeof(cmd));
 	if (ret < 0) {
@@ -195,6 +215,9 @@ static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 			((u32)buf[3] >> 4);
 	*raw_temp = (((u32)buf[3] & 0x0F) << 16) | ((u32)buf[4] << 8) |
 		    (u32)buf[5];
+
+	data->last_read = jiffies;
+	data->last_read_valid = true;
 
 	dev_dbg(&client->dev, "raw hum=0x%05x temp=0x%05x\n",
 		*raw_humidity, *raw_temp);
