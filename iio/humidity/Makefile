@@ -1,9 +1,12 @@
 obj-m := dht20.o
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
-
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) 
+
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) modules_install
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f *.o *~ core .depend .*.cmd *.ko *.mod.c 
+	rm -f Module.markers modules.order Module.symvers
+	rm -rf .tmp_versions Modules.symvers
