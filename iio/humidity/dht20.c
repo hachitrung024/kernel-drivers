@@ -7,20 +7,32 @@
 
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/jiffies.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/types.h>
 
 #include <linux/iio/iio.h>
+
+#define DHT20_CMD_TRIGGER		0xAC
+#define DHT20_CMD_TRIGGER_ARG0		0x33
+#define DHT20_CMD_TRIGGER_ARG1		0x00
 
 #define DHT20_REG_INIT_1		0x1B
 #define DHT20_REG_INIT_2		0x1C
 #define DHT20_REG_INIT_3		0x1E
 #define DHT20_REG_WRITE_OR		0xB0
 
-#define DHT20_POWERON_DELAY_MS		100
-#define DHT20_POLL_INTERVAL_MS		10
+#define DHT20_STATUS_BUSY		BIT(7)
 #define DHT20_STATUS_INIT_MASK		0x18
+
+#define DHT20_POWERON_DELAY_MS		100
+#define DHT20_MEAS_DELAY_MS		80
+#define DHT20_POLL_RETRY		3
+#define DHT20_POLL_INTERVAL_MS		10
+
+#define DHT20_RESP_LEN			7
 
 struct dht20_data {
 	struct i2c_client	*client;
@@ -43,12 +55,6 @@ static int dht20_read_status(struct i2c_client *client, u8 *status)
 	return 0;
 }
 
-/*
- * Per ASAIR reference code, when the calibration/init status bits are
- * not set after power-on the three hidden calibration registers (0x1B,
- * 0x1C, 0x1E) must be reloaded with their factory values through the
- * "JH_Reset_REG" sequence.
- */
 static int dht20_reset_reg(struct dht20_data *data, u8 reg)
 {
 	struct i2c_client *client = data->client;
@@ -78,7 +84,6 @@ static int dht20_reset_reg(struct dht20_data *data, u8 reg)
 	msleep(DHT20_POLL_INTERVAL_MS);
 
 	buf[0] = DHT20_REG_WRITE_OR | reg;
-	/* buf[1], buf[2] carry the values just read back from the sensor */
 
 	ret = i2c_master_send(client, buf, sizeof(buf));
 	if (ret < 0) {
@@ -104,6 +109,70 @@ static int dht20_init_sensor(struct dht20_data *data)
 		return ret;
 
 	return dht20_reset_reg(data, DHT20_REG_INIT_3);
+}
+
+static int dht20_wait_not_busy(struct i2c_client *client)
+{
+	u8 status;
+	int ret, i;
+
+	for (i = 0; i < DHT20_POLL_RETRY; i++) {
+		ret = dht20_read_status(client, &status);
+		if (ret < 0)
+			return ret;
+
+		if (!(status & DHT20_STATUS_BUSY))
+			return 0;
+
+		msleep(DHT20_POLL_INTERVAL_MS);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
+			     u32 *raw_temp)
+{
+	struct i2c_client *client = data->client;
+	u8 cmd[3] = { DHT20_CMD_TRIGGER, DHT20_CMD_TRIGGER_ARG0,
+		      DHT20_CMD_TRIGGER_ARG1 };
+	u8 buf[DHT20_RESP_LEN];
+	int ret;
+
+	ret = i2c_master_send(client, cmd, sizeof(cmd));
+	if (ret < 0) {
+		dev_err(&client->dev, "trigger measurement failed: %d\n", ret);
+		return ret;
+	}
+
+	msleep(DHT20_MEAS_DELAY_MS);
+
+	ret = dht20_wait_not_busy(client);
+	if (ret < 0) {
+		dev_err(&client->dev, "sensor busy after measurement: %d\n", ret);
+		return ret;
+	}
+
+	ret = i2c_master_recv(client, buf, sizeof(buf));
+	if (ret < 0) {
+		dev_err(&client->dev, "data read failed: %d\n", ret);
+		return ret;
+	}
+	if (ret != sizeof(buf)) {
+		dev_err(&client->dev, "short read: %d of %zu bytes\n",
+			ret, sizeof(buf));
+		return -EIO;
+	}
+
+	*raw_humidity = ((u32)buf[1] << 12) | ((u32)buf[2] << 4) |
+			((u32)buf[3] >> 4);
+	*raw_temp = (((u32)buf[3] & 0x0F) << 16) | ((u32)buf[4] << 8) |
+		    (u32)buf[5];
+
+	dev_dbg(&client->dev, "raw hum=0x%05x temp=0x%05x\n",
+		*raw_humidity, *raw_temp);
+
+	return 0;
 }
 
 static int dht20_probe(struct i2c_client *client)
