@@ -5,6 +5,7 @@
  * Datasheet: DHT20 Data Sheet v1.0, May 2021 (www.aosong.com)
  */
 
+#include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/jiffies.h>
@@ -32,6 +33,9 @@
 #define DHT20_POLL_RETRY		3
 #define DHT20_POLL_INTERVAL_MS		10
 
+#define DHT20_CRC_INIT			0xFF
+#define DHT20_CRC_POLY			0x31
+
 #define DHT20_RESP_LEN			7
 
 struct dht20_data {
@@ -42,6 +46,24 @@ struct dht20_data {
 static const struct iio_info dht20_info = {};
 
 static const struct iio_chan_spec dht20_channels[] = {};
+
+static u8 dht20_crc8(const u8 *data, int len)
+{
+	u8 crc = DHT20_CRC_INIT;
+	int i, j;
+
+	for (i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (j = 0; j < 8; j++) {
+			if (crc & 0x80)
+				crc = (crc << 1) ^ DHT20_CRC_POLY;
+			else
+				crc <<= 1;
+		}
+	}
+
+	return crc;
+}
 
 static int dht20_read_status(struct i2c_client *client, u8 *status)
 {
@@ -161,6 +183,11 @@ static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 	if (ret != sizeof(buf)) {
 		dev_err(&client->dev, "short read: %d of %zu bytes\n",
 			ret, sizeof(buf));
+		return -EIO;
+	}
+
+	if (dht20_crc8(buf, 6) != buf[6]) {
+		dev_err(&client->dev, "CRC mismatch, discarding sample\n");
 		return -EIO;
 	}
 
