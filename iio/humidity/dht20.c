@@ -3,6 +3,11 @@
  * ASAIR DHT20 I2C humidity and temperature sensor driver.
  *
  * Datasheet: DHT20 Data Sheet v1.0, May 2021 (www.aosong.com)
+ *
+ * The sensor uses a fixed I2C address (0x38) and exposes a 20-bit
+ * relative humidity reading and a 20-bit temperature reading. Data is
+ * fully calibrated on-chip, so this driver reports IIO processed
+ * values in milli-%RH and milli-degrees Celsius.
  */
 
 #include <linux/bitops.h>
@@ -37,6 +42,9 @@
 #define DHT20_CRC_INIT			0xFF
 #define DHT20_CRC_POLY			0x31
 
+#define DHT20_RAW_BITS			20
+#define DHT20_RAW_SCALE			(1U << DHT20_RAW_BITS)
+
 #define DHT20_RESP_LEN			7
 
 struct dht20_data {
@@ -44,34 +52,6 @@ struct dht20_data {
 	struct mutex		lock;	/* serializes I2C transactions */
 	unsigned long		last_read;
 	bool			last_read_valid;
-};
-
-static const struct iio_info dht20_info = {};
-
-static const struct iio_chan_spec dht20_channels[] = {
-	{
-		.type = IIO_HUMIDITYRELATIVE,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.scan_index = 0,
-		.scan_type = {
-			.sign = 'u',
-			.realbits = 20,
-			.storagebits = 32,
-			.endianness = IIO_CPU,
-		},
-	},
-	{
-		.type = IIO_TEMP,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.scan_index = 1,
-		.scan_type = {
-			.sign = 's',
-			.realbits = 20,
-			.storagebits = 32,
-			.endianness = IIO_CPU,
-		},
-	},
-	IIO_CHAN_SOFT_TIMESTAMP(2),
 };
 
 static u8 dht20_crc8(const u8 *data, int len)
@@ -249,6 +229,77 @@ static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 	return 0;
 }
 
+static int dht20_read_processed(struct dht20_data *data,
+				struct iio_chan_spec const *chan, int *val)
+{
+	u32 raw_humidity, raw_temp;
+	int ret;
+
+	mutex_lock(&data->lock);
+	ret = dht20_read_sensor(data, &raw_humidity, &raw_temp);
+	mutex_unlock(&data->lock);
+	if (ret)
+		return ret;
+
+	switch (chan->type) {
+	case IIO_HUMIDITYRELATIVE:
+		/* milli-%RH = raw * 100 * 1000 / 2^20 */
+		*val = (int)(((s64)raw_humidity * 100000) >> DHT20_RAW_BITS);
+		return IIO_VAL_INT;
+	case IIO_TEMP:
+		/* milli-°C = raw * 200 * 1000 / 2^20 - 50000 */
+		*val = (int)(((s64)raw_temp * 200000) >> DHT20_RAW_BITS) -
+		       50000;
+		return IIO_VAL_INT;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int dht20_read_raw(struct iio_dev *indio_dev,
+			  struct iio_chan_spec const *chan,
+			  int *val, int *val2, long mask)
+{
+	struct dht20_data *data = iio_priv(indio_dev);
+
+	switch (mask) {
+	case IIO_CHAN_INFO_PROCESSED:
+		return dht20_read_processed(data, chan, val);
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct iio_info dht20_info = {
+	.read_raw = dht20_read_raw,
+};
+
+static const struct iio_chan_spec dht20_channels[] = {
+	{
+		.type = IIO_HUMIDITYRELATIVE,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+		.scan_index = 0,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 20,
+			.storagebits = 32,
+			.endianness = IIO_CPU,
+		},
+	},
+	{
+		.type = IIO_TEMP,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+		.scan_index = 1,
+		.scan_type = {
+			.sign = 's',
+			.realbits = 20,
+			.storagebits = 32,
+			.endianness = IIO_CPU,
+		},
+	},
+	IIO_CHAN_SOFT_TIMESTAMP(2),
+};
+
 static int dht20_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -295,7 +346,14 @@ static int dht20_probe(struct i2c_client *client)
 	indio_dev->channels = dht20_channels;
 	indio_dev->num_channels = ARRAY_SIZE(dht20_channels);
 
-	return devm_iio_device_register(dev, indio_dev);
+	ret = devm_iio_device_register(dev, indio_dev);
+	if (ret) {
+		dev_err(dev, "failed to register IIO device: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(dev, "DHT20 probe OK at 0x%02x\n", client->addr);
+	return 0;
 }
 
 static const struct i2c_device_id dht20_id[] = {
