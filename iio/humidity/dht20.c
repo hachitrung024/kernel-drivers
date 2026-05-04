@@ -48,7 +48,31 @@ struct dht20_data {
 
 static const struct iio_info dht20_info = {};
 
-static const struct iio_chan_spec dht20_channels[] = {};
+static const struct iio_chan_spec dht20_channels[] = {
+	{
+		.type = IIO_HUMIDITYRELATIVE,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+		.scan_index = 0,
+		.scan_type = {
+			.sign = 'u',
+			.realbits = 20,
+			.storagebits = 32,
+			.endianness = IIO_CPU,
+		},
+	},
+	{
+		.type = IIO_TEMP,
+		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
+		.scan_index = 1,
+		.scan_type = {
+			.sign = 's',
+			.realbits = 20,
+			.storagebits = 32,
+			.endianness = IIO_CPU,
+		},
+	},
+	IIO_CHAN_SOFT_TIMESTAMP(2),
+};
 
 static u8 dht20_crc8(const u8 *data, int len)
 {
