@@ -52,6 +52,8 @@ struct dht20_data {
 	struct mutex		lock;	/* serializes I2C transactions */
 	unsigned long		last_read;
 	bool			last_read_valid;
+	u32			cached_humidity;
+	u32			cached_temp;
 };
 
 static u8 dht20_crc8(const u8 *data, int len)
@@ -140,6 +142,24 @@ static int dht20_init_sensor(struct dht20_data *data)
 	return dht20_reset_reg(data, DHT20_REG_INIT_3);
 }
 
+static int dht20_ensure_ready(struct dht20_data *data)
+{
+	struct i2c_client *client = data->client;
+	u8 status;
+	int ret;
+
+	msleep(DHT20_POWERON_DELAY_MS);
+
+	ret = dht20_read_status(client, &status);
+	if (ret < 0)
+		return ret;
+
+	if ((status & DHT20_STATUS_INIT_MASK) != DHT20_STATUS_INIT_MASK)
+		return dht20_init_sensor(data);
+
+	return 0;
+}
+
 static int dht20_wait_not_busy(struct i2c_client *client)
 {
 	u8 status;
@@ -159,21 +179,6 @@ static int dht20_wait_not_busy(struct i2c_client *client)
 	return -ETIMEDOUT;
 }
 
-static void dht20_wait_min_interval(struct dht20_data *data)
-{
-	unsigned long elapsed, remaining;
-
-	if (!data->last_read_valid)
-		return;
-
-	elapsed = jiffies_to_msecs(jiffies - data->last_read);
-	if (elapsed >= DHT20_MIN_INTERVAL_MS)
-		return;
-
-	remaining = DHT20_MIN_INTERVAL_MS - elapsed;
-	msleep(remaining);
-}
-
 static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 			     u32 *raw_temp)
 {
@@ -183,7 +188,11 @@ static int dht20_read_sensor(struct dht20_data *data, u32 *raw_humidity,
 	u8 buf[DHT20_RESP_LEN];
 	int ret;
 
-	dht20_wait_min_interval(data);
+	if (!data->last_read_valid) {
+		ret = dht20_ensure_ready(data);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = i2c_master_send(client, cmd, sizeof(cmd));
 	if (ret < 0) {
@@ -233,21 +242,36 @@ static int dht20_read_processed(struct dht20_data *data,
 				struct iio_chan_spec const *chan, int *val)
 {
 	u32 raw_humidity, raw_temp;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&data->lock);
-	ret = dht20_read_sensor(data, &raw_humidity, &raw_temp);
+
+	if (!data->last_read_valid ||
+	    jiffies_to_msecs(jiffies - data->last_read) >= DHT20_MIN_INTERVAL_MS) {
+		ret = dht20_read_sensor(data, &raw_humidity, &raw_temp);
+		if (!ret) {
+			data->cached_humidity = raw_humidity;
+			data->cached_temp = raw_temp;
+		} else {
+			data->last_read_valid = false;
+		}
+	}
+
+	if (!ret) {
+		raw_humidity = data->cached_humidity;
+		raw_temp = data->cached_temp;
+	}
+
 	mutex_unlock(&data->lock);
+
 	if (ret)
 		return ret;
 
 	switch (chan->type) {
 	case IIO_HUMIDITYRELATIVE:
-		/* milli-%RH = raw * 100 * 1000 / 2^20 */
 		*val = (int)(((s64)raw_humidity * 100000) >> DHT20_RAW_BITS);
 		return IIO_VAL_INT;
 	case IIO_TEMP:
-		/* milli-°C = raw * 200 * 1000 / 2^20 - 50000 */
 		*val = (int)(((s64)raw_temp * 200000) >> DHT20_RAW_BITS) -
 		       50000;
 		return IIO_VAL_INT;
@@ -278,26 +302,11 @@ static const struct iio_chan_spec dht20_channels[] = {
 	{
 		.type = IIO_HUMIDITYRELATIVE,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.scan_index = 0,
-		.scan_type = {
-			.sign = 'u',
-			.realbits = 20,
-			.storagebits = 32,
-			.endianness = IIO_CPU,
-		},
 	},
 	{
 		.type = IIO_TEMP,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED),
-		.scan_index = 1,
-		.scan_type = {
-			.sign = 's',
-			.realbits = 20,
-			.storagebits = 32,
-			.endianness = IIO_CPU,
-		},
 	},
-	IIO_CHAN_SOFT_TIMESTAMP(2),
 };
 
 static int dht20_probe(struct i2c_client *client)
@@ -305,7 +314,6 @@ static int dht20_probe(struct i2c_client *client)
 	struct device *dev = &client->dev;
 	struct iio_dev *indio_dev;
 	struct dht20_data *data;
-	u8 status;
 	int ret;
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
@@ -321,23 +329,11 @@ static int dht20_probe(struct i2c_client *client)
 
 	i2c_set_clientdata(client, indio_dev);
 
-	msleep(DHT20_POWERON_DELAY_MS);
-
-	ret = dht20_read_status(client, &status);
+	ret = dht20_ensure_ready(data);
 	if (ret < 0) {
-		dev_err(dev, "DHT20 not found at 0x%02x: %d\n",
+		dev_err(dev, "DHT20 not found or init failed at 0x%02x: %d\n",
 			client->addr, ret);
-		return -ENXIO;
-	}
-
-	if ((status & DHT20_STATUS_INIT_MASK) != DHT20_STATUS_INIT_MASK) {
-		dev_dbg(dev, "calibration not loaded (status=0x%02x), initializing\n",
-			status);
-		ret = dht20_init_sensor(data);
-		if (ret) {
-			dev_err(dev, "sensor initialization failed: %d\n", ret);
-			return ret;
-		}
+		return ret;
 	}
 
 	indio_dev->name = "dht20";
